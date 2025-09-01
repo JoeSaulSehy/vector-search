@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# OS/Editor
+.DS_Store
+.vscode/
+.idea/
+
+# Caches
+.cache/
+hf_cache/
+root/.cache/
