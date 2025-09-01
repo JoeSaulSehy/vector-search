@@ -1,6 +1,15 @@
+# Keep PyPI as the main index, add PyTorch's CPU wheels as an extra index
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 flask==3.0.2
+flask-cors==4.0.0
 gunicorn==21.2.0
 transformers==4.43.4
+
+# Torch CPU wheel (resolved from the extra index)
 torch==2.3.1
+
+# FAISS CPU (works well with Py 3.11; use post1 if needed)
 faiss-cpu==1.8.0
+
 numpy==1.26.4
