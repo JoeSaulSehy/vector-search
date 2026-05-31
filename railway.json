@@ -3,6 +3,10 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "python app.py"
+    "startCommand": "gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 300 --worker-class uvicorn.workers.UvicornWorker --preload",
+    "healthcheckPath": "/health",
+    "healthcheckTimeout": 300,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 3
   }
 }
