@@ -1,97 +1,380 @@
-import os, json, numpy as np, faiss, torch, html
-from flask import Flask, request, jsonify, make_response
-from transformers import AutoTokenizer, AutoModel
+"""
+Stacking Benjamins RAG API.
 
-# ---------- Config ----------
-API_KEY = os.getenv("SB_API_KEY", "")  # set this in Railway
-MODEL_NAME = os.getenv("MODEL_NAME", "ahmedrachid/FinancialBERT")
-INDEX_PATH = os.getenv("FAISS_INDEX", "data/faiss_ip.index")
-META_PATH  = os.getenv("FAISS_META",  "data/metadata.json")
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+Production FastAPI server for question-answering against Stacking Benjamins
+guides. Uses HyPE (Hypothetical Prompt Embeddings) for retrieval, Claude Haiku
+for synthesis, and Supabase for query logging.
 
-# ---------- Load model & index on startup ----------
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModel.from_pretrained(MODEL_NAME).to(DEVICE)
-model.eval()
+Run locally:
+    uvicorn app:app --reload --port 8000
 
-index = faiss.read_index(INDEX_PATH)
-with open(META_PATH, "r", encoding="utf-8") as f:
-    id2meta = json.load(f)
+Run in production (Railway uses this command):
+    gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 300 \\
+        --worker-class uvicorn.workers.UvicornWorker --preload
+"""
 
-@torch.no_grad()
-def embed_texts(texts, batch_size=16):
-    vecs = []
-    max_pos = getattr(model.config, "max_position_embeddings", 512)
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i+batch_size]
-        enc = tokenizer(batch, padding=True, truncation=False, return_tensors="pt")
-        if enc["input_ids"].shape[1] > max_pos:
-            enc = tokenizer(batch, padding=True, truncation=True, max_length=max_pos, return_tensors="pt")
-        enc = {k: v.to(DEVICE) for k, v in enc.items()}
-        out = model(**enc).last_hidden_state
-        mask = enc["attention_mask"].unsqueeze(-1)
-        sent_emb = ((out * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)).cpu().numpy().astype("float32")
-        vecs.append(sent_emb)
-    X = np.vstack(vecs).astype("float32")
-    faiss.normalize_L2(X)
-    return X
+import json
+import logging
+import os
+import time
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Optional
 
-def run_search(query, top_k=5):
-    q_emb = embed_texts([query], batch_size=1)
-    scores, ids = index.search(q_emb, top_k)
+import anthropic
+import faiss
+import numpy as np
+import torch
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from sentence_transformers import SentenceTransformer
+from supabase import create_client, Client
+
+from prompts import SYSTEM_PROMPT, format_user_prompt
+from scope_config import (
+    SCOPE_CONFIG,
+    SOURCE_TO_SCOPE,
+    REFUSE_THRESHOLD,
+    CHUNKS_FOR_SYNTHESIS,
+    REFUSAL_MESSAGE,
+    get_upsell_message,
+)
+
+
+# ---------- Environment ----------
+
+load_dotenv()  # Loads .env in local dev; no-op in production (env vars set in Railway)
+
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5")
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+DATA_DIR = os.getenv("DATA_DIR", "data")
+
+
+# ---------- Logging ----------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("sb-rag")
+
+
+# ---------- Global state (populated at startup) ----------
+
+class AppState:
+    embed_model: SentenceTransformer
+    anthropic_client: anthropic.Anthropic
+    supabase: Client
+    hype_records: list
+    section_id2meta: list
+    hype_index: faiss.IndexFlatIP
+
+
+state = AppState()
+
+
+# ---------- Startup ----------
+
+def load_artifacts():
+    """Load HyPE artifacts from disk and build the in-memory FAISS index."""
+    logger.info("Loading HyPE artifacts from %s/", DATA_DIR)
+
+    with open(f"{DATA_DIR}/hype_records.json", "r", encoding="utf-8") as f:
+        state.hype_records = json.load(f)
+    logger.info("  hype_records: %d question records", len(state.hype_records))
+
+    with open(f"{DATA_DIR}/section_id2meta.json", "r", encoding="utf-8") as f:
+        state.section_id2meta = json.load(f)
+    logger.info("  section_id2meta: %d chunks", len(state.section_id2meta))
+
+    emb_matrix = np.load(f"{DATA_DIR}/hype_emb_matrix.npy")
+    logger.info("  hype_emb_matrix: shape %s", emb_matrix.shape)
+
+    state.hype_index = faiss.IndexFlatIP(emb_matrix.shape[1])
+    state.hype_index.add(emb_matrix)
+    logger.info("  FAISS index built: %d vectors, %d dims", state.hype_index.ntotal, emb_matrix.shape[1])
+
+
+def load_embed_model():
+    """Initialize the sentence-transformers model used for query embedding."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info("Loading embedding model %s on %s", EMBED_MODEL_NAME, device)
+    state.embed_model = SentenceTransformer(EMBED_MODEL_NAME, device=device)
+    # Warm up: trigger the first inference call during startup, not during a request.
+    # Some torch+macOS combos segfault on first encode(); better to crash loudly here.
+    logger.info("Warming up embedding model with a dummy query...")
+    _ = state.embed_model.encode(["warmup query"], normalize_embeddings=True, convert_to_numpy=True)
+    logger.info("Embedding model ready")
+
+
+def init_clients():
+    """Set up Anthropic and Supabase clients."""
+    state.anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    state.supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    logger.info("Anthropic and Supabase clients initialized")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Run once at app startup; cleanup on shutdown."""
+    logger.info("=" * 60)
+    logger.info("Starting Stacking Benjamins RAG API")
+    logger.info("=" * 60)
+    load_embed_model()
+    load_artifacts()
+    init_clients()
+    logger.info("Startup complete - ready to serve")
+    yield
+    logger.info("Shutting down")
+
+
+# ---------- Retrieval ----------
+
+def embed_query(query: str) -> np.ndarray:
+    """Embed a single query using bge-small-en-v1.5."""
+    emb = state.embed_model.encode(
+        [query],
+        batch_size=1,
+        normalize_embeddings=True,
+        convert_to_numpy=True,
+        show_progress_bar=False,
+    )
+    return emb.astype("float32")
+
+
+def hype_search(query: str, retrieve_k: int = 20) -> list:
+    """
+    Search by matching the user's query against indexed hypothetical questions.
+    Returns chunks (not questions) sorted by best question-match score.
+    """
+    q_emb = embed_query(query)
+    scores, ids = state.hype_index.search(q_emb, retrieve_k * 2)
+
+    # Deduplicate by chunk_id - keep best score per chunk
+    seen_chunks = {}
+    for score, q_idx in zip(scores[0], ids[0]):
+        record = state.hype_records[int(q_idx)]
+        chunk_id = record["chunk_id"]
+        if chunk_id not in seen_chunks or score > seen_chunks[chunk_id]["match_score"]:
+            seen_chunks[chunk_id] = {
+                "match_score": float(score),
+                "matched_question": record["question"],
+            }
+
+    sorted_chunks = sorted(seen_chunks.items(), key=lambda x: x[1]["match_score"], reverse=True)[:retrieve_k]
+
     results = []
-    for score, idx in zip(scores[0], ids[0]):
-        meta = id2meta[int(idx)]
+    for chunk_id, match_info in sorted_chunks:
+        meta = state.section_id2meta[chunk_id]
         results.append({
+            "chunk_id": chunk_id,
             "source": meta["source"],
-            "chunk_idx": meta["chunk_idx"],
-            "char_start": meta["char_start"],
-            "char_end": meta["char_end"],
-            "score": float(score),
+            "section_heading": meta.get("section_heading", ""),
             "text": meta["text"],
+            "match_score": match_info["match_score"],
+            "matched_question": match_info["matched_question"],
         })
     return results
 
-def render_html(results, q):
-    items = []
-    for r in results:
-        items.append(
-            "<li>"
-            f"<strong>{html.escape(r['source'])}</strong> · score {r['score']:.3f}"
-            f"<div style='white-space:pre-wrap;margin-top:4px'>{html.escape(r['text'])}</div>"
-            "</li>"
-        )
-    body = "".join(items) if items else "<li>No results</li>"
-    return f"<h3>Results for: {html.escape(q)}</h3><ul>{body}</ul>"
 
-app = Flask(__name__)
+def format_chunks_for_synthesis(results: list) -> str:
+    """Build a clean labeled chunk listing to send to Haiku."""
+    parts = []
+    for i, r in enumerate(results, 1):
+        source_label = r["source"].replace(".md", "").replace("_", " ")
+        heading = r.get("section_heading", "") or "(no heading)"
+        parts.append(f"[Passage {i}] from {source_label}, section {heading}\n{r['text']}\n")
+    return "\n".join(parts)
 
-def authorized(req):  # simple API key check
-    key = req.headers.get("X-API-Key", "")
-    return (API_KEY and key == API_KEY)
 
-@app.route("/search", methods=["GET"])
-def search_route():
-    if not authorized(request):
-        return make_response("Unauthorized", 401)
-    q = (request.args.get("q") or "").strip()
-    if not q:
-        return make_response("Missing query (?q=...)", 400)
+# ---------- Synthesis ----------
+
+def synthesize_answer(query: str, chunks: list) -> dict:
+    """Call Haiku to generate an answer from the retrieved chunks."""
+    chunks_text = format_chunks_for_synthesis(chunks)
+    response = state.anthropic_client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=500,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": format_user_prompt(query, chunks_text)}],
+    )
+    answer = response.content[0].text
+    input_tokens = response.usage.input_tokens
+    output_tokens = response.usage.output_tokens
+    # Haiku 4.5 pricing: $1 input / $5 output per million tokens
+    cost = (input_tokens * 1.0 + output_tokens * 5.0) / 1_000_000
+    return {
+        "answer": answer,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cost_usd": cost,
+    }
+
+
+# ---------- Mode A5 routing ----------
+
+def route_query(query: str, scope: str) -> dict:
+    """
+    Three-outcome routing:
+      1. ANSWER  - in-scope retrieval crosses threshold; synthesize via Haiku
+      2. UPSELL  - in-scope misses but another guide has a strong match
+      3. REFUSE  - nothing in any scope crosses threshold
+
+    Returns a dict ready to serialize as JSON to the client.
+    """
+    if scope not in SCOPE_CONFIG:
+        raise HTTPException(status_code=400, detail=f"Unknown scope: {scope}")
+
+    config = SCOPE_CONFIG[scope]
+    allowed_sources = set(config["allowed_sources"])
+
+    all_results = hype_search(query, retrieve_k=20)
+
+    if not all_results:
+        return {
+            "decision": "REFUSE",
+            "scope": scope,
+            "top_score": 0.0,
+            "answer": REFUSAL_MESSAGE,
+            "sources": [],
+            "cost_usd": 0.0,
+        }
+
+    in_scope = [r for r in all_results if r["source"] in allowed_sources]
+    out_scope = [r for r in all_results if r["source"] not in allowed_sources]
+
+    # Step 1: in-scope match good enough? -> ANSWER
+    if in_scope and in_scope[0]["match_score"] >= REFUSE_THRESHOLD:
+        top_chunks = in_scope[:CHUNKS_FOR_SYNTHESIS]
+        synth = synthesize_answer(query, top_chunks)
+        return {
+            "decision": "ANSWER",
+            "scope": scope,
+            "top_score": in_scope[0]["match_score"],
+            "answer": synth["answer"],
+            "sources": [
+                {
+                    "source": r["source"],
+                    "section_heading": r["section_heading"],
+                    "match_score": r["match_score"],
+                }
+                for r in top_chunks
+            ],
+            "matched_question": in_scope[0]["matched_question"],
+            "input_tokens": synth["input_tokens"],
+            "output_tokens": synth["output_tokens"],
+            "cost_usd": synth["cost_usd"],
+        }
+
+    # Step 2: any out-of-scope chunk crosses threshold AND maps to a sellable guide? -> UPSELL
+    for r in out_scope:
+        if r["match_score"] < REFUSE_THRESHOLD:
+            break  # Sorted desc; nothing else will qualify
+        target_scope = SOURCE_TO_SCOPE.get(r["source"])
+        if target_scope is not None:
+            return {
+                "decision": "UPSELL",
+                "scope": scope,
+                "top_score": r["match_score"],
+                "answer": get_upsell_message(target_scope),
+                "upsell_target": target_scope,
+                "upsell_url": SCOPE_CONFIG[target_scope]["url"],
+                "sources": [],
+                "cost_usd": 0.0,
+            }
+
+    # Step 3: REFUSE
+    return {
+        "decision": "REFUSE",
+        "scope": scope,
+        "top_score": all_results[0]["match_score"],
+        "answer": REFUSAL_MESSAGE,
+        "sources": [],
+        "cost_usd": 0.0,
+    }
+
+
+# ---------- Logging ----------
+
+def log_query(query: str, scope: str, result: dict, latency_ms: int):
+    """Write a row to Supabase. Failures here should not break the user response."""
     try:
-        k = int(request.args.get("k", 5))
-    except ValueError:
-        k = 5
-    results = run_search(q, top_k=k)
-    if (request.args.get("format") or "html").lower() == "json":
-        return jsonify({"query": q, "results": results})
-    resp = make_response(render_html(results, q), 200)
-    resp.headers["Content-Type"] = "text/html; charset=utf-8"
-    return resp
+        row = {
+            "query": query,
+            "scope": scope,
+            "decision": result["decision"],
+            "top_score": result.get("top_score"),
+            "answer": result.get("answer"),
+            "matched_question": result.get("matched_question"),
+            "upsell_target": result.get("upsell_target"),
+            "source_chunks": result.get("sources", []),
+            "input_tokens": result.get("input_tokens"),
+            "output_tokens": result.get("output_tokens"),
+            "cost_usd": result.get("cost_usd", 0.0),
+            "latency_ms": latency_ms,
+        }
+        state.supabase.table("query_logs").insert(row).execute()
+    except Exception as e:
+        # Log to console but don't fail the user request
+        logger.error("Failed to log query to Supabase: %s", e)
 
-@app.route("/health")
+
+# ---------- FastAPI app ----------
+
+app = FastAPI(
+    title="Stacking Benjamins RAG API",
+    description="Question-answering against Stacking Benjamins guides",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# CORS - allow requests from the Stacking Benjamins domain
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://www.stackingbenjamins.com",
+        "https://stackingbenjamins.com",
+        "http://localhost:3000",  # for local widget testing
+        "http://localhost:8000",
+    ],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+
+class SearchRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=500)
+    scope: str = Field(..., description="One of: tax-guide, college-guide, workplace-benefits")
+
+
+@app.get("/health")
 def health():
-    return "ok", 200
+    """Health check for Railway uptime monitoring."""
+    return {
+        "status": "ok",
+        "chunks_loaded": len(state.section_id2meta) if hasattr(state, "section_id2meta") else 0,
+        "questions_indexed": len(state.hype_records) if hasattr(state, "hype_records") else 0,
+        "scopes_available": list(SCOPE_CONFIG.keys()),
+    }
 
-if __name__ == "__main__":
-    port = int(os.getenv("PORT", 8000))
-    app.run(host="0.0.0.0", port=port)
+
+@app.post("/search")
+def search(request: SearchRequest):
+    """Main endpoint: take a query + scope, return an answer/upsell/refusal."""
+    start = time.time()
+    try:
+        result = route_query(request.query, request.scope)
+        latency_ms = int((time.time() - start) * 1000)
+        log_query(request.query, request.scope, result, latency_ms)
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Search failed for query=%r scope=%r", request.query, request.scope)
+        raise HTTPException(status_code=500, detail="Internal error")
