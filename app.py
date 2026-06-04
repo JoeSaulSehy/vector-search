@@ -8,7 +8,7 @@ for synthesis, and Supabase for query logging.
 Run locally:
     uvicorn app:app --reload --port 8000
 
-Run in production (Railway uses this command):
+Run in production (Railway uses this command via railway.json):
     gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 300 \\
         --worker-class uvicorn.workers.UvicornWorker --preload
 """
@@ -17,8 +17,10 @@ import json
 import logging
 import os
 import time
+from collections import defaultdict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from threading import Lock
 from typing import Optional
 
 import anthropic
@@ -50,6 +52,7 @@ load_dotenv()  # Loads .env in local dev; no-op in production (env vars set in R
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
+PAGE_TOKEN = os.environ["PAGE_TOKEN"]
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5")
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 DATA_DIR = os.getenv("DATA_DIR", "data")
@@ -324,21 +327,53 @@ def log_query(query: str, scope: str, result: dict, latency_ms: int):
         logger.error("Failed to log query to Supabase: %s", e)
 
 
+# ---------- Rate limiting (in-memory) ----------
+# Tracks 8 queries/hour/IP. Resets on container restart, which is fine for beta.
+# If Railway ever runs multiple replicas, swap to a Supabase-backed counter.
+
+RATE_LIMIT_WINDOW_SECONDS = 3600  # 1 hour
+RATE_LIMIT_MAX = 8
+
+_rate_limit_store: dict[str, list[float]] = defaultdict(list)
+_rate_limit_lock = Lock()
+
+
+def check_rate_limit(ip: str) -> tuple[bool, int]:
+    """
+    Returns (allowed, remaining_seconds_until_next_slot).
+    remaining_seconds is 0 when allowed.
+    """
+    now = time.time()
+    cutoff = now - RATE_LIMIT_WINDOW_SECONDS
+    with _rate_limit_lock:
+        timestamps = [t for t in _rate_limit_store[ip] if t > cutoff]
+        if len(timestamps) >= RATE_LIMIT_MAX:
+            oldest = min(timestamps)
+            wait = int(oldest + RATE_LIMIT_WINDOW_SECONDS - now)
+            _rate_limit_store[ip] = timestamps
+            return False, max(wait, 1)
+        timestamps.append(now)
+        _rate_limit_store[ip] = timestamps
+        return True, 0
+
+
 # ---------- FastAPI app ----------
 
 app = FastAPI(
     title="Stacking Benjamins RAG API",
     description="Question-answering against Stacking Benjamins guides",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
-# CORS - allow requests from the Stacking Benjamins domain
+# CORS - allow requests from the Stacking Benjamins domain and the Firebase pages.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://www.stackingbenjamins.com",
         "https://stackingbenjamins.com",
+        "https://sb-ai-chat.web.app",
+        "https://sb-ai-chat.firebaseapp.com",
         "http://localhost:3000",  # for local widget testing
         "http://localhost:8000",
     ],
@@ -365,8 +400,25 @@ def health():
 
 
 @app.post("/search")
-def search(request: SearchRequest):
+def search(request: SearchRequest, http_request: Request):
     """Main endpoint: take a query + scope, return an answer/upsell/refusal."""
+    # Token check - simple shared secret. Stops casual API abuse from anyone who
+    # finds the URL but isn't paying. Anyone with a page can still extract the
+    # token from JS, but that's fine - the rate limit caps damage.
+    token = http_request.headers.get("X-Page-Token", "")
+    if token != PAGE_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid or missing page token")
+
+    # Rate limit - per IP, 8 per hour
+    client_ip = http_request.client.host if http_request.client else "unknown"
+    allowed, wait_seconds = check_rate_limit(client_ip)
+    if not allowed:
+        minutes = max(wait_seconds // 60, 1)
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded. Try again in {minutes} minutes.",
+        )
+
     start = time.time()
     try:
         result = route_query(request.query, request.scope)
