@@ -53,8 +53,8 @@ CHUNKS_FOR_SYNTHESIS = 3
 
 # Refusal copy shown when a query genuinely can't be answered.
 REFUSAL_MESSAGE = (
-    "Sorry Stacker, our guides do not cover this yet. "
-    "We have logged your question to add to our guide updates."
+    "I couldn't find that trail on this map yet. "
+    "I've added your question to our guide update list so we can chart it for future Stackers."
 )
 
 
