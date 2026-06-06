@@ -9,7 +9,7 @@ Run locally:
     uvicorn app:app --reload --port 8000
 
 Run in production (Railway uses this command via railway.json):
-    gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 300 \\
+    gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 600 \\
         --worker-class uvicorn.workers.UvicornWorker --preload
 """
 
@@ -34,7 +34,7 @@ from pydantic import BaseModel, Field
 from sentence_transformers import SentenceTransformer
 from supabase import create_client, Client
 
-from prompts import SYSTEM_PROMPT, format_user_prompt
+from prompts import get_system_prompt, format_user_prompt
 from scope_config import (
     SCOPE_CONFIG,
     SOURCE_TO_SCOPE,
@@ -200,10 +200,16 @@ def format_chunks_for_synthesis(results: list) -> str:
 def synthesize_answer(query: str, chunks: list) -> dict:
     """Call Haiku to generate an answer from the retrieved chunks."""
     chunks_text = format_chunks_for_synthesis(chunks)
+    # Compute current year at request time. The prompt tells Haiku what year
+    # it is; Haiku infers the source's tax year from the chunks themselves
+    # (which explicitly label dollar amounts with "for 2025" etc.) and
+    # handles any mismatch. No code changes needed when guides are updated.
+    current_year = datetime.now(timezone.utc).year
+    system_prompt = get_system_prompt(current_year)
     response = state.anthropic_client.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=500,
-        system=SYSTEM_PROMPT,
+        system=system_prompt,
         messages=[{"role": "user", "content": format_user_prompt(query, chunks_text)}],
     )
     answer = response.content[0].text
@@ -328,11 +334,11 @@ def log_query(query: str, scope: str, result: dict, latency_ms: int):
 
 
 # ---------- Rate limiting (in-memory) ----------
-# Tracks 8 queries/hour/IP. Resets on container restart, which is fine for beta.
+# Tracks 5 queries/hour/IP. Resets on container restart, which is fine for beta.
 # If Railway ever runs multiple replicas, swap to a Supabase-backed counter.
 
 RATE_LIMIT_WINDOW_SECONDS = 3600  # 1 hour
-RATE_LIMIT_MAX = 8
+RATE_LIMIT_MAX = 5
 
 _rate_limit_store: dict[str, list[float]] = defaultdict(list)
 _rate_limit_lock = Lock()
@@ -362,7 +368,7 @@ def check_rate_limit(ip: str) -> tuple[bool, int]:
 app = FastAPI(
     title="Stacking Benjamins RAG API",
     description="Question-answering against Stacking Benjamins guides",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
 )
 
@@ -409,7 +415,7 @@ def search(request: SearchRequest, http_request: Request):
     if token != PAGE_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid or missing page token")
 
-    # Rate limit - per IP, 8 per hour
+    # Rate limit - per IP, 5 per hour
     client_ip = http_request.client.host if http_request.client else "unknown"
     allowed, wait_seconds = check_rate_limit(client_ip)
     if not allowed:
