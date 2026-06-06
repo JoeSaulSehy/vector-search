@@ -242,7 +242,13 @@ def route_query(query: str, scope: str) -> dict:
     config = SCOPE_CONFIG[scope]
     allowed_sources = set(config["allowed_sources"])
 
-    all_results = hype_search(query, retrieve_k=20)
+    # Augment the query with the current year so retrieval prefers chunks
+    # labeled with the present-day year over historical ones. Users who ask
+    # "this year" or don't specify a year implicitly mean the current year -
+    # this nudges HyPE matching toward chunks tagged with that year.
+    current_year = datetime.now(timezone.utc).year
+    augmented_query = f"{query} ({current_year})"
+    all_results = hype_search(augmented_query, retrieve_k=20)
 
     if not all_results:
         return {
@@ -368,7 +374,7 @@ def check_rate_limit(ip: str) -> tuple[bool, int]:
 app = FastAPI(
     title="Stacking Benjamins RAG API",
     description="Question-answering against Stacking Benjamins guides",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
