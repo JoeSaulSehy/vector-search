@@ -65,3 +65,32 @@ def get_upsell_message(target_scope: str) -> str:
         f"Great question Stacker! We cover those topics in our "
         f"{config['display_name']} - you can find it at {config['url']}"
     )
+
+
+# Topic overrides: specific phrases that should ALWAYS route to a given scope,
+# even if another guide has content that scores higher in retrieval.
+#
+# Keep this list as small as possible. Only add entries when there's a known
+# UX problem with the default routing. Most queries should route via the
+# normal in-scope-first logic.
+#
+# Match is case-insensitive substring. Adding "529" matches "529 plan",
+# "529 plans", "529s", etc.
+TOPIC_OVERRIDES = {
+    "college-guide": [
+        "529",
+    ],
+}
+
+
+def find_topic_override(query: str):
+    """
+    Check if the query contains a phrase that's been hardcoded to route to
+    a specific scope. Returns the scope name if matched, None otherwise.
+    """
+    query_lower = query.lower()
+    for scope, phrases in TOPIC_OVERRIDES.items():
+        for phrase in phrases:
+            if phrase.lower() in query_lower:
+                return scope
+    return None

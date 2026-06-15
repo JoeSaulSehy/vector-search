@@ -42,6 +42,7 @@ from scope_config import (
     CHUNKS_FOR_SYNTHESIS,
     REFUSAL_MESSAGE,
     get_upsell_message,
+    find_topic_override,
 )
 
 
@@ -242,6 +243,23 @@ def route_query(query: str, scope: str) -> dict:
     config = SCOPE_CONFIG[scope]
     allowed_sources = set(config["allowed_sources"])
 
+    # Topic override check: handle known problem cases where retrieval gives
+    # the "wrong" answer for product reasons. E.g., 529 questions always belong
+    # to college-guide even though tax-guide has detailed 529 content.
+    # See TOPIC_OVERRIDES in scope_config.py.
+    override_scope = find_topic_override(query)
+    if override_scope is not None and override_scope != scope:
+        return {
+            "decision": "UPSELL",
+            "scope": scope,
+            "top_score": 1.0,  # Synthetic - override fired before retrieval
+            "answer": get_upsell_message(override_scope),
+            "upsell_target": override_scope,
+            "upsell_url": SCOPE_CONFIG[override_scope]["url"],
+            "sources": [],
+            "cost_usd": 0.0,
+        }
+
     # Augment the query with the current year so retrieval prefers chunks
     # labeled with the present-day year over historical ones. Users who ask
     # "this year" or don't specify a year implicitly mean the current year -
@@ -374,7 +392,7 @@ def check_rate_limit(ip: str) -> tuple[bool, int]:
 app = FastAPI(
     title="Stacking Benjamins RAG API",
     description="Question-answering against Stacking Benjamins guides",
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
