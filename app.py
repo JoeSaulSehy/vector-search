@@ -392,7 +392,7 @@ def check_rate_limit(ip: str) -> tuple[bool, int]:
 app = FastAPI(
     title="Stacking Benjamins RAG API",
     description="Question-answering against Stacking Benjamins guides",
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -420,12 +420,24 @@ class SearchRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    """Health check for Railway uptime monitoring."""
+    """Health check for Railway uptime monitoring. Also touches Supabase to
+    keep the free-tier project from being paused for inactivity (Supabase
+    pauses free projects after 7 days with no database activity)."""
+    # Lightweight Supabase ping - keeps the inactivity timer fresh.
+    # We just check that we can query the query_logs table; we don't care
+    # about the result. Failure is logged but doesn't fail the health check.
+    db_alive = False
+    try:
+        state.supabase.table("query_logs").select("id").limit(1).execute()
+        db_alive = True
+    except Exception as e:
+        logger.warning("Supabase health ping failed: %s", e)
     return {
         "status": "ok",
         "chunks_loaded": len(state.section_id2meta) if hasattr(state, "section_id2meta") else 0,
         "questions_indexed": len(state.hype_records) if hasattr(state, "hype_records") else 0,
         "scopes_available": list(SCOPE_CONFIG.keys()),
+        "db_alive": db_alive,
     }
 
 
