@@ -418,7 +418,7 @@ class SearchRequest(BaseModel):
     scope: str = Field(..., description="One of: tax-guide, college-guide, workplace-benefits")
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 def health():
     """Health check for Railway uptime monitoring. Also touches Supabase to
     keep the free-tier project from being paused for inactivity (Supabase
