@@ -67,30 +67,36 @@ def get_upsell_message(target_scope: str) -> str:
     )
 
 
-# Topic overrides: specific phrases that should ALWAYS route to a given scope,
-# even if another guide has content that scores higher in retrieval.
+# Topic overrides: specific phrases that should UPSELL to a target scope
+# from listed source scopes, even if normal routing would answer.
 #
-# Keep this list as small as possible. Only add entries when there's a known
-# UX problem with the default routing. Most queries should route via the
-# normal in-scope-first logic.
+# Each entry maps: trigger phrase -> {target_scope, upsell_from_scopes}
+# If the user's scope is in upsell_from_scopes, we UPSELL to target_scope.
+# If the user's scope is NOT in upsell_from_scopes (e.g., they're already
+# on target_scope, OR on a scope that's allowed to answer), normal routing
+# applies.
 #
-# Match is case-insensitive substring. Adding "529" matches "529 plan",
-# "529 plans", "529s", etc.
-TOPIC_OVERRIDES = {
-    "college-guide": [
-        "529",
-    ],
-}
+# Keep this list small. Only add entries with a specific UX problem.
+TOPIC_OVERRIDES = [
+    {
+        "phrases": ["529"],
+        "target_scope": "college-guide",
+        "upsell_from_scopes": ["workplace-benefits"],
+    },
+]
 
 
-def find_topic_override(query: str):
+def find_topic_override(query: str, current_scope: str):
     """
-    Check if the query contains a phrase that's been hardcoded to route to
-    a specific scope. Returns the scope name if matched, None otherwise.
+    Check if the query contains a phrase that's been hardcoded to UPSELL
+    to a specific scope from the user's current scope. Returns the target
+    scope name if matched, None otherwise.
     """
     query_lower = query.lower()
-    for scope, phrases in TOPIC_OVERRIDES.items():
-        for phrase in phrases:
+    for override in TOPIC_OVERRIDES:
+        if current_scope not in override["upsell_from_scopes"]:
+            continue  # Current scope is allowed to answer; no override
+        for phrase in override["phrases"]:
             if phrase.lower() in query_lower:
-                return scope
+                return override["target_scope"]
     return None

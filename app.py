@@ -244,11 +244,11 @@ def route_query(query: str, scope: str) -> dict:
     allowed_sources = set(config["allowed_sources"])
 
     # Topic override check: handle known problem cases where retrieval gives
-    # the "wrong" answer for product reasons. E.g., 529 questions always belong
-    # to college-guide even though tax-guide has detailed 529 content.
+    # the "wrong" answer for product reasons. Each override defines which
+    # scopes should UPSELL to a target rather than answer themselves.
     # See TOPIC_OVERRIDES in scope_config.py.
-    override_scope = find_topic_override(query)
-    if override_scope is not None and override_scope != scope:
+    override_scope = find_topic_override(query, scope)
+    if override_scope is not None:
         return {
             "decision": "UPSELL",
             "scope": scope,
@@ -392,7 +392,7 @@ def check_rate_limit(ip: str) -> tuple[bool, int]:
 app = FastAPI(
     title="Stacking Benjamins RAG API",
     description="Question-answering against Stacking Benjamins guides",
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -422,7 +422,8 @@ class SearchRequest(BaseModel):
 def health():
     """Health check for Railway uptime monitoring. Also touches Supabase to
     keep the free-tier project from being paused for inactivity (Supabase
-    pauses free projects after 7 days with no database activity)."""
+    pauses free projects after 7 days with no database activity).
+    Accepts both GET and HEAD so UptimeRobot's free-tier HEAD requests work."""
     # Lightweight Supabase ping - keeps the inactivity timer fresh.
     # We just check that we can query the query_logs table; we don't care
     # about the result. Failure is logged but doesn't fail the health check.
