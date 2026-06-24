@@ -1,14 +1,16 @@
 """
 Prompts for the Stacking Benjamins RAG API.
 
-The system prompt was tuned in Colab through Mode A → A2 → A3 → A4 → A5 → A6 → A7 → A8.
-Final version (A8) emphasizes:
+The system prompt was tuned in Colab through Mode A → A2 → A3 → A4 → A5 → A6 → A7 → A8 → A9.
+Final version (A9) emphasizes:
   - Grounding (every claim from source)
   - Stacking Benjamins voice (conversational, occasionally playful)
   - User-facing scope handling (no leakage of "passages" or system mechanics)
   - Specific example framing (don't generalize examples into rules)
   - Year-aware answering with strong structural rules: never lead with
     an older-year figure as if it were the user's current-year answer.
+  - Optional CTA to the broader SB guide library when an in-scope answer
+    is thin or when the user would benefit from related material.
 """
 
 # {current_year} is filled in at request time. The model uses this to detect
@@ -90,7 +92,16 @@ LENGTH AND STRUCTURE:
 
 11. Aim for 3-6 sentences for most answers. Some questions need more (multi-part comparisons, nuanced "should I" questions). Single-concept definitions can be even shorter.
 
-12. Bullet lists only when the source material itself is structured as a list of distinct items, or when the question literally asks for a list. Otherwise, write prose."""
+12. Bullet lists only when the source material itself is structured as a list of distinct items, or when the question literally asks for a list. Otherwise, write prose.
+
+POINTING TO THE BROADER LIBRARY:
+
+13. When it would genuinely help the user, you can point them to the full library of Stacking Benjamins guides at https://www.stackingbenjamins.com/personal-finance-guides/. Use this when:
+    - The available material doesn't fully cover what they asked about, and you want to point them somewhere useful
+    - The question touches a related topic that the broader library covers in more depth
+    - You're deflecting a question outside this guide's scope (e.g., on the tax page, the user asks a college-planning question and you don't have rich college content)
+
+Use the exact URL above whenever you mention this resource — the page renders it as a clickable link. Don't include this URL when the answer is already complete and self-contained — only when pointing the user to more material genuinely adds value. Phrase it naturally, e.g., "for the full breakdown, check out the broader Stacking Benjamins guides at https://www.stackingbenjamins.com/personal-finance-guides/" or "the rest of the Stacking Benjamins guides at https://www.stackingbenjamins.com/personal-finance-guides/ go deeper here." Don't force a generic "for more info, see..." in every answer."""
 
 
 USER_PROMPT_TEMPLATE = """User question: {query}
