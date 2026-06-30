@@ -37,12 +37,13 @@ from supabase import create_client, Client
 from prompts import get_system_prompt, format_user_prompt
 from scope_config import (
     SCOPE_CONFIG,
-    SOURCE_TO_SCOPE,
     REFUSE_THRESHOLD,
     CHUNKS_FOR_SYNTHESIS,
     REFUSAL_MESSAGE,
     get_upsell_message,
     find_topic_override,
+    source_matches_scope,
+    get_scope_for_source,
 )
 
 
@@ -240,9 +241,6 @@ def route_query(query: str, scope: str) -> dict:
     if scope not in SCOPE_CONFIG:
         raise HTTPException(status_code=400, detail=f"Unknown scope: {scope}")
 
-    config = SCOPE_CONFIG[scope]
-    allowed_sources = set(config["allowed_sources"])
-
     # Topic override check: handle known problem cases where retrieval gives
     # the "wrong" answer for product reasons. Each override defines which
     # scopes should UPSELL to a target rather than answer themselves.
@@ -278,8 +276,11 @@ def route_query(query: str, scope: str) -> dict:
             "cost_usd": 0.0,
         }
 
-    in_scope = [r for r in all_results if r["source"] in allowed_sources]
-    out_scope = [r for r in all_results if r["source"] not in allowed_sources]
+    # Pattern-based in-scope filtering - lives in scope_config.py.
+    # Any source filename containing the scope's patterns or the book pattern
+    # counts as "in scope" for this query.
+    in_scope = [r for r in all_results if source_matches_scope(r["source"], scope)]
+    out_scope = [r for r in all_results if not source_matches_scope(r["source"], scope)]
 
     # Step 1: in-scope match good enough? -> ANSWER
     if in_scope and in_scope[0]["match_score"] >= REFUSE_THRESHOLD:
@@ -308,7 +309,7 @@ def route_query(query: str, scope: str) -> dict:
     for r in out_scope:
         if r["match_score"] < REFUSE_THRESHOLD:
             break  # Sorted desc; nothing else will qualify
-        target_scope = SOURCE_TO_SCOPE.get(r["source"])
+        target_scope = get_scope_for_source(r["source"])
         if target_scope is not None:
             return {
                 "decision": "UPSELL",
@@ -392,7 +393,7 @@ def check_rate_limit(ip: str) -> tuple[bool, int]:
 app = FastAPI(
     title="Stacking Benjamins RAG API",
     description="Question-answering against Stacking Benjamins guides",
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
